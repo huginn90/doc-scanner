@@ -1,54 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
-  type Point, type Quad,
+  type Quad,
   applyHomography, homography, isConvex, orderQuad, outputSize, pageSizePt,
 } from '../src/lib/geometry';
-import { type RGBA, applyFilter, createRGBA, detectByRegion, warp } from '../src/lib/imgproc';
+import { applyFilter, createRGBA, detectByRegion, warp } from '../src/lib/imgproc';
 import { buildPdf } from '../src/lib/pdf';
-
-// ---------------------------------------------------------------- 합성 이미지 도우미
-
-function inPoly(p: Point, poly: readonly Point[]) {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const a = poly[i], b = poly[j];
-    if ((a.y > p.y) !== (b.y > p.y) && p.x < ((b.x - a.x) * (p.y - a.y)) / (b.y - a.y) + a.x) inside = !inside;
-  }
-  return inside;
-}
-
-function fillPoly(img: RGBA, poly: readonly Point[], [r, g, b]: number[]) {
-  for (let y = 0; y < img.height; y++) {
-    for (let x = 0; x < img.width; x++) {
-      if (!inPoly({ x: x + 0.5, y: y + 0.5 }, poly)) continue;
-      const j = (y * img.width + x) * 4;
-      img.data[j] = r; img.data[j + 1] = g; img.data[j + 2] = b; img.data[j + 3] = 255;
-    }
-  }
-}
-
-const UNIT: Quad = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
-const PAPER = [240, 236, 228];
-const INK = [30, 30, 30];
-
-/** 어두운 책상 위에 비스듬히 놓인 문서(글자 줄 포함) */
-function synthPhoto() {
-  const img = createRGBA(480, 360);
-  fillPoly(img, [{ x: 0, y: 0 }, { x: 480, y: 0 }, { x: 480, y: 360 }, { x: 0, y: 360 }], [70, 50, 35]);
-  const corners: Quad = [{ x: 120, y: 50 }, { x: 330, y: 30 }, { x: 370, y: 320 }, { x: 140, y: 335 }];
-  fillPoly(img, corners, PAPER);
-  const H = homography(UNIT, corners);
-  for (let t = 0.15; t < 0.85; t += 0.07) {
-    const line = [{ x: 0.1, y: t }, { x: 0.9, y: t }, { x: 0.9, y: t + 0.02 }, { x: 0.1, y: t + 0.02 }];
-    fillPoly(img, line.map(p => applyHomography(H, p)), INK);
-  }
-  return { img, corners };
-}
-
-const px = (img: RGBA, x: number, y: number) => {
-  const j = (Math.round(y) * img.width + Math.round(x)) * 4;
-  return [img.data[j], img.data[j + 1], img.data[j + 2]];
-};
+import { UNIT, cornerError, px, synthPhoto } from './synth';
 
 // ---------------------------------------------------------------- 기하
 
@@ -89,11 +46,7 @@ describe('imgproc', () => {
     const { img, corners } = synthPhoto();
     const det = detectByRegion(img);
     expect(det).not.toBeNull();
-    const q = orderQuad(det!.quad);
-    q.forEach((p, i) => {
-      expect(Math.abs(p.x - corners[i].x)).toBeLessThan(5);
-      expect(Math.abs(p.y - corners[i].y)).toBeLessThan(5);
-    });
+    expect(cornerError(orderQuad(det!.quad), corners)).toBeLessThan(5);
   });
 
   it('원근 보정 후 문서가 화면을 채우고 글자 줄이 수평이 된다', () => {

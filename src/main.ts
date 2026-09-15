@@ -7,6 +7,7 @@ import type { RGBA } from './lib/imgproc';
 import { type Surface, createSurface, ctx2d, decodeImage, encodeJpeg, release } from './lib/canvas';
 import { detectDocument, finishPreview, renderPage, warpDocument } from './lib/pipeline';
 import { buildPdf } from './lib/pdf';
+import { warmUpDetector } from './lib/detector';
 
 const PREVIEW_DPI = 110;
 const JPEG_QUALITY = 0.88;
@@ -89,7 +90,7 @@ async function addFiles(list: FileList | File[]) {
     await nextFrame();
     try {
       const src = await decodeImage(files[0]);
-      const { quad, found } = detectDocument(src);
+      const { quad, found } = await detectDocument(src);
       const page: Page = { id: nextId++, source: files[0], quad, settings: { ...state.defaults } };
       busy();
       openEditor(page, src, true);
@@ -108,7 +109,7 @@ async function addFiles(list: FileList | File[]) {
     await nextFrame();
     try {
       const src = await decodeImage(files[i]);
-      const { quad, found } = detectDocument(src);
+      const { quad, found } = await detectDocument(src);
       if (!found) missed++;
       const page: Page = { id: nextId++, source: files[i], quad, settings: { ...state.defaults } };
       await renderOutput(page, src);
@@ -433,9 +434,12 @@ function drawLoupe(p: Point) {
   cx.stroke();
 }
 
-$('#autoBtn').addEventListener('click', () => {
+$('#autoBtn').addEventListener('click', async () => {
   if (!ed) return;
-  const { quad, found } = detectDocument(ed.src);
+  busy('문서를 찾는 중…');
+  const { quad, found } = await detectDocument(ed.src);
+  busy();
+  if (!ed) return;
   ed.quad = quad;
   drawOverlay();
   if (!found) toast('문서를 찾지 못했어요. 직접 맞춰 주세요.');
@@ -571,7 +575,8 @@ $('#shareBtn').addEventListener('click', async () => {
 });
 
 renderList();
+warmUpDetector();
 
 if (import.meta.env.DEV) {
-  Object.assign(window, { __scanner: { state, addFiles } });
+  Object.assign(window, { __scanner: { state, addFiles, detectDocument } });
 }
