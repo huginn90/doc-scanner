@@ -12,6 +12,25 @@ export const createRGBA = (width: number, height: number): RGBA =>
 export const cloneRGBA = (img: RGBA): RGBA =>
   ({ data: new Uint8ClampedArray(img.data), width: img.width, height: img.height });
 
+/** 시계 방향으로 k×90° 회전한 새 이미지 */
+export function rotateRGBA(img: RGBA, k: number): RGBA {
+  k = ((k % 4) + 4) % 4;
+  if (!k) return cloneRGBA(img);
+  const { width: w, height: h, data: s } = img;
+  const out = k === 2 ? createRGBA(w, h) : createRGBA(h, w);
+  const o32 = new Uint32Array(out.data.buffer), s32 = new Uint32Array(s.buffer, s.byteOffset, w * h);
+  const ow = out.width;
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const v = s32[y * w + x];
+      if (k === 1) o32[x * ow + (h - 1 - y)] = v;
+      else if (k === 2) o32[(h - 1 - y) * ow + (w - 1 - x)] = v;
+      else o32[(w - 1 - x) * ow + y] = v;
+    }
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- 기본 연산
 
 /** 분리형 박스 블러 (running sum), in-place */
@@ -262,7 +281,8 @@ export function warpSourceRegion(quad: Quad, srcW: number, srcH: number, outW: n
   const h = Math.max(2, Math.min(srcH, Math.ceil(Math.max(...ys)) + 2) - y);
   const sideW = Math.max(dist(tl, tr), dist(bl, br));
   const sideH = Math.max(dist(tl, bl), dist(tr, br));
-  const scale = Math.min(1, 1.3 * Math.max(outW / sideW, outH / sideH));
+  // 출력보다 약간(1.15배) 크게만 남겨 화질은 유지하면서 메모리 사용을 줄임
+  const scale = Math.min(1, 1.15 * Math.max(outW / sideW, outH / sideH));
   return { x, y, w, h, scale };
 }
 

@@ -1,26 +1,38 @@
 // OpenCV 기반 문서 감지
 //  1) 잡티(털·질감)를 줄이고 채널별 Canny로 경계 지도 + 색 기울기 방향 계산
 //  2) 후보 사각형: 직선(Hough) 조합 + 윤곽선 근사 + 외부 후보(영역 기반)
-//  3) 채점: 네 변을 따라 "방향이 맞는" 경계가 있는 비율 × 면적 × A4 비율 선호
-//  4) 최종 사각형의 각 변을 경계 픽셀에 직선 맞춤해 모서리를 정밀하게 보정
-import { type Point, type Quad, dist, isConvex, orderQuad, polyArea } from './geometry';
-import { type Detection, type RGBA, maxAreaQuad } from './imgproc';
+//  3) 채점: 네 변의 경계 일치(방향 포함) × 면적 × A4 비율 × 여백 일관성
+//  4) 네 변을 하나씩 돌아가며 더 잘 맞는 직선으로 바꿔 보고(좌표 하강), 경계 픽셀에 정밀 맞춤
+//  5) detectRobust: 사진을 0/90/180/270° 돌려 각각 감지하고 가장 많이 일치한 결과 채택
+import {
+  type Point, type Quad,
+  applyHomography, dist, homography, isConvex, orderQuad, polyArea, unrotatePoint,
+} from './geometry';
+import { type Detection, type RGBA, detectByRegion, maxAreaQuad, rotateRGBA } from './imgproc';
 import type { CV } from './opencv';
 
 type Mat = InstanceType<CV['Mat']>;
 
-/** 경계 픽셀과 그 위치의 기울기(경계에 수직 방향) */
-export interface EdgeField { w: number; h: number; edges: Uint8Array; gx: Float32Array; gy: Float32Array }
+/** 경계 픽셀, 그 위치의 기울기(경계에 수직 방향), 평활화한 RGB(3채널) */
+export interface EdgeField {
+  w: number; h: number;
+  edges: Uint8Array; gx: Float32Array; gy: Float32Array;
+  rgb?: Uint8Array;
+}
 
 /** 법선 형태 직선: nx·x + ny·y = rho, theta ∈ [0, π) 는 직선 방향. a/b는 대표 선분 끝점 */
 interface Line { nx: number; ny: number; rho: number; theta: number; len: number; a?: Point; b?: Point }
+
+export interface RobustDetection extends Detection { votes: number }
 
 const MIN_AREA = 0.1;        // 이미지 대비 최소 면적
 const MIN_SUPPORT = 0.5;     // 네 변이 실제 경계와 겹치는 최소 점수
 const ALIGN_COS = 0.85;      // 경계 방향이 변과 ~30° 이내로 맞아야 인정
 const A4_RATIO = Math.SQRT2;
-const MAX_LINES = 20;
+const MAX_LINES = 20;        // 직선 두 쌍 조합(계산량 큼)에 쓰는 상위 직선 수
+const MAX_CYCLE_LINES = 60;  // 변 하나씩 바꿔 보기에 쓰는 직선 수 (글자 줄이 많아도 종이 외곽이 빠지지 않도록)
 const DEG = Math.PI / 180;
+const UNIT: Quad = [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: 1, y: 1 }, { x: 0, y: 1 }];
 
 // ---------------------------------------------------------------- 채점
 
@@ -63,6 +75,59 @@ export function aspectFactor(q: Quad): number {
   return 0.6 + 0.4 * Math.exp(-z * z / 2);
 }
 
+/**
+ * 여백 일관성 (0~1): 네 변 안쪽 띠의 색이 서로 같은 종이 색인지.
+ * 문서 밖의 책상·키보드까지 끌어안은 사각형은 그 변 안쪽이 다른 색이라 낮게 나옴.
+ */
+export function marginConsistency(f: EdgeField, q: Quad): number {
+  const rgb = f.rgb;
+  if (!rgb) return 1;
+  const H = homography(UNIT, q);
+  const at = (u: number, v: number) => {
+    const p = applyHomography(H, { x: u, y: v });
+    const x = Math.min(f.w - 2, Math.max(1, Math.round(p.x)));
+    const y = Math.min(f.h - 2, Math.max(1, Math.round(p.y)));
+    const c = [0, 0, 0];
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        const j = ((y + dy) * f.w + x + dx) * 3;
+        c[0] += rgb[j]; c[1] += rgb[j + 1]; c[2] += rgb[j + 2];
+      }
+    }
+    return c.map(v => v / 9);
+  };
+  // 기준 색은 네 변 안쪽 띠 전체의 중앙값. 문서 내용(글자·사진)에 흔들리지 않고,
+  // 한 변만 문서 밖(책상·키보드)으로 나가면 나머지 세 변이 기준을 잡아 그 변이 걸러짐
+  const INSET = 0.035, N = 15, TOL = 50;
+  const bands = [0, 1, 2, 3].map(s => Array.from({ length: N }, (_, k) => {
+    const t = 0.1 + 0.8 * k / (N - 1);
+    const [u, v] = s === 0 ? [t, INSET] : s === 1 ? [1 - INSET, t] : s === 2 ? [t, 1 - INSET] : [INSET, t];
+    return at(u, v);
+  }));
+  const med = [0, 1, 2].map(c => {
+    const v = bands.flat().map(s => s[c]).sort((a, b) => a - b);
+    return v[v.length >> 1];
+  });
+  const sides = bands.map(b =>
+    b.filter(c => Math.hypot(c[0] - med[0], c[1] - med[1], c[2] - med[2]) < TOL).length / N);
+  return 0.5 * (sides[0] + sides[1] + sides[2] + sides[3]) / 4 + 0.5 * Math.min(...sides);
+}
+
+function makeScorer(f: EdgeField) {
+  const minSide = 0.1 * Math.min(f.w, f.h);
+  return (quad: Quad): number => {
+    if (!isConvex(quad)) return -1;
+    if (quad.some((p, i) => dist(p, quad[(i + 1) % 4]) < minSide)) return -1;
+    const areaFrac = Math.abs(polyArea(quad)) / (f.w * f.h);
+    if (areaFrac < MIN_AREA) return -1;
+    const support = quadSupport(f, quad);
+    if (support < MIN_SUPPORT) return -1;
+    // 경계 일치가 가장 중요. 비슷하면 큰 사각형(양식 안쪽 표가 아닌 종이 외곽)과 A4 비율,
+    // 그리고 변 안쪽이 종이 색으로 고른 사각형을 선호
+    return support * support * Math.sqrt(areaFrac) * aspectFactor(quad) * (0.4 + 0.6 * marginConsistency(f, quad));
+  };
+}
+
 // ---------------------------------------------------------------- 경계 지도
 
 function buildField(cv: CV, img: RGBA, track: (m: Mat) => Mat): { field: EdgeField; edgesMat: Mat } {
@@ -92,7 +157,7 @@ function buildField(cv: CV, img: RGBA, track: (m: Mat) => Mat): { field: EdgeFie
   }
 
   // 색 기울기: 픽셀마다 R/G/B 중 변화가 가장 큰 채널의 Sobel 방향
-  const d = smooth.data as Uint8Array;
+  const d = new Uint8Array(smooth.data);
   const gx = new Float32Array(w * h), gy = new Float32Array(w * h);
   for (let y = 1; y < h - 1; y++) {
     for (let x = 1; x < w - 1; x++) {
@@ -111,10 +176,10 @@ function buildField(cv: CV, img: RGBA, track: (m: Mat) => Mat): { field: EdgeFie
       gy[i] = by;
     }
   }
-  return { field: { w, h, edges: new Uint8Array(edges.data), gx, gy }, edgesMat: edges };
+  return { field: { w, h, edges: new Uint8Array(edges.data), gx, gy, rgb: d }, edgesMat: edges };
 }
 
-// ---------------------------------------------------------------- 후보: 직선 조합
+// ---------------------------------------------------------------- 직선
 
 const angleDiff = (a: number, b: number) => {
   const d = Math.abs(a - b) % Math.PI;
@@ -134,6 +199,11 @@ function intersect(a: Line, b: Line): Point | null {
   if (Math.abs(det) < 1e-6) return null;
   return { x: (a.rho * b.ny - a.ny * b.rho) / det, y: (a.nx * b.rho - a.rho * b.nx) / det };
 }
+
+const project = (l: Line, p: Point): Point => {
+  const d = l.nx * p.x + l.ny * p.y - l.rho;
+  return { x: p.x - d * l.nx, y: p.y - d * l.ny };
+};
 
 /**
  * 선분 검출 후 같은 직선끼리 묶어 "방향이 맞는 길이" 합이 긴 순으로.
@@ -164,13 +234,8 @@ function houghLines(cv: CV, edges: Mat, f: EdgeField, track: (m: Mat) => Mat): L
     if (same) same.len += s.len;
     else merged.push({ ...s });
   }
-  return merged.sort((a, b) => b.len - a.len).slice(0, MAX_LINES).map(l => refineLine(f, l));
+  return merged.sort((a, b) => b.len - a.len).slice(0, MAX_CYCLE_LINES).map(l => refineLine(f, l));
 }
-
-const project = (l: Line, p: Point): Point => {
-  const d = l.nx * p.x + l.ny * p.y - l.rho;
-  return { x: p.x - d * l.nx, y: p.y - d * l.ny };
-};
 
 /** Hough 직선은 몇 px 어긋나므로 실제 경계 픽셀에 두 번 맞춰 정밀화 */
 function refineLine(f: EdgeField, l: Line): Line {
@@ -184,6 +249,21 @@ function refineLine(f: EdgeField, l: Line): Line {
   return cur;
 }
 
+/** 변 네 개(위·오른쪽·아래·왼쪽 순)의 교차점으로 사각형. 이미지 밖으로 3% 넘게 나가면 null */
+function quadFromSides(sides: Line[], w: number, h: number): Quad | null {
+  const mx = w * 0.03, my = h * 0.03;
+  const pts: Point[] = [];
+  for (let i = 0; i < 4; i++) {
+    const p = intersect(sides[(i + 3) % 4], sides[i]);
+    if (!p || p.x < -mx || p.y < -my || p.x > w + mx || p.y > h + my) return null;
+    pts.push({ x: Math.min(w, Math.max(0, p.x)), y: Math.min(h, Math.max(0, p.y)) });
+  }
+  return pts as Quad;
+}
+
+const sidesOf = (q: Quad): Line[] =>
+  q.map((a, i) => { const b = q[(i + 1) % 4]; return lineFrom(a.x, a.y, b.x, b.y, dist(a, b)); });
+
 /** 대략 평행한 직선 두 쌍으로 사각형 만들기 (원근 때문에 최대 35°까지 기울어짐 허용) */
 function lineQuads(lines: Line[], w: number, h: number): Quad[] {
   const pairs: [Line, Line][] = [];
@@ -191,21 +271,42 @@ function lineQuads(lines: Line[], w: number, h: number): Quad[] {
     for (let j = i + 1; j < lines.length; j++)
       if (angleDiff(lines[i].theta, lines[j].theta) < 35 * DEG) pairs.push([lines[i], lines[j]]);
 
-  const mx = w * 0.03, my = h * 0.03;
   const quads: Quad[] = [];
   for (let p = 0; p < pairs.length; p++) {
     for (let q = p + 1; q < pairs.length; q++) {
       const [a, b] = pairs[p], [c, d] = pairs[q];
       if (a === c || a === d || b === c || b === d) continue;
       if (angleDiff(a.theta, c.theta) < 45 * DEG || angleDiff(b.theta, d.theta) < 45 * DEG) continue;
-      const pts = [intersect(a, c), intersect(c, b), intersect(b, d), intersect(d, a)];
-      if (pts.some(pt => !pt || pt.x < -mx || pt.y < -my || pt.x > w + mx || pt.y > h + my)) continue;
-      quads.push(orderQuad((pts as Point[]).map(pt => ({
-        x: Math.min(w, Math.max(0, pt.x)), y: Math.min(h, Math.max(0, pt.y)),
-      }))));
+      const quad = quadFromSides([a, c, b, d], w, h);
+      if (quad) quads.push(orderQuad(quad));
     }
   }
   return quads;
+}
+
+/**
+ * 네 변을 하나씩 돌아가며(위→오른쪽→아래→왼쪽) 방향이 비슷한 다른 직선으로 바꿔 보고
+ * 점수가 오르면 교체. 한 바퀴 동안 바뀐 게 없을 때까지 반복.
+ */
+function cycleSides(start: Quad, lines: Line[], score: (q: Quad) => number, w: number, h: number): { quad: Quad; score: number } {
+  let sides = sidesOf(start);
+  let quad = start, best = score(start);
+  for (let round = 0; round < 4; round++) {
+    let changed = false;
+    for (let s = 0; s < 4; s++) {
+      for (const cand of lines) {
+        if (angleDiff(cand.theta, sides[s].theta) > 20 * DEG) continue;
+        const trial = sides.slice();
+        trial[s] = cand;
+        const q = quadFromSides(trial, w, h);
+        if (!q) continue;
+        const sc = score(q);
+        if (sc > best + 1e-9) { best = sc; quad = q; sides = trial; changed = true; }
+      }
+    }
+    if (!changed) break;
+  }
+  return { quad, score: best };
 }
 
 // ---------------------------------------------------------------- 후보: 윤곽선
@@ -247,6 +348,7 @@ function contourQuads(cv: CV, edges: Mat, w: number, h: number, track: (m: Mat) 
 /** 변 주변(±3px)의 방향이 맞는 경계 픽셀에 직선 맞춤 (주성분 분석) */
 function fitSide(f: EdgeField, a: Point, b: Point): Line | null {
   const len = dist(a, b);
+  if (len < 2) return null;
   const nx = -(b.y - a.y) / len, ny = (b.x - a.x) / len;
   const xs: number[] = [], ys: number[] = [];
   for (let k = 0, n = Math.round(len); k <= n; k++) {
@@ -288,39 +390,69 @@ function refineQuad(f: EdgeField, q: Quad): Quad {
 
 // ---------------------------------------------------------------- 감지
 
-/** 테스트·디버그용: 주어진 사각형들의 채점 요소 */
-export function inspectQuads(cv: CV, img: RGBA, quads: Quad[]) {
+/** 테스트·디버그용: 검출·정밀화된 직선 목록 */
+export function debugLines(cv: CV, img: RGBA) {
   const mats: Mat[] = [];
   const track = (m: Mat) => (mats.push(m), m);
   try {
     const { field, edgesMat } = buildField(cv, img, track);
+    return houghLines(cv, edgesMat, field, track)
+      .map(l => ({ deg: +(l.theta / DEG).toFixed(1), rho: Math.round(l.rho), len: Math.round(l.len) }));
+  } finally {
+    mats.forEach(m => m.delete());
+  }
+}
+
+/** 테스트·디버그용: 출처별 후보 중 점수 상위 */
+export function debugCandidates(cv: CV, img: RGBA, extra: Quad[] = [], top = 5) {
+  const mats: Mat[] = [];
+  const track = (m: Mat) => (mats.push(m), m);
+  try {
+    const { width: w, height: h } = img;
+    const { field, edgesMat } = buildField(cv, img, track);
     const lines = houghLines(cv, edgesMat, field, track);
-    const lq = lineQuads(lines, img.width, img.height);
-    const target = orderQuad(quads[0]);
-    const err = (q: Quad) => Math.max(...q.map((p, i) => dist(p, target[i])));
-    const nearest = lq.reduce<Quad | null>((b, q) => (!b || err(q) < err(b) ? q : b), null);
+    const score = makeScorer(field);
+    const tagged = [
+      ...extra.map(q => ({ src: 'extra', quad: orderQuad(q) })),
+      ...contourQuads(cv, edgesMat, w, h, track).map(quad => ({ src: 'contour', quad })),
+      ...lineQuads(lines.slice(0, MAX_LINES), w, h).map(quad => ({ src: 'lines', quad })),
+    ];
+    const round = (q: Quad) => q.map(p => [Math.round(p.x), Math.round(p.y)]);
     return {
-      lines: lines.map(l => ({ deg: +(l.theta / DEG).toFixed(1), rho: Math.round(l.rho), len: Math.round(l.len) })),
-      lineQuads: lq.length,
-      nearestLineQuadErr: nearest ? +err(nearest).toFixed(1) : null,
-      quads: quads.map(q => {
-        const quad = orderQuad(q);
-        const s = quad.map((a, i) => sideSupport(field, a, quad[(i + 1) % 4]));
-        return {
-          sides: s.map(v => +v.toFixed(2)),
-          support: +quadSupport(field, quad).toFixed(3),
-          area: +(Math.abs(polyArea(quad)) / (img.width * img.height)).toFixed(3),
-          aspect: +aspectFactor(quad).toFixed(3),
-        };
-      }),
+      counts: { extra: extra.length, total: tagged.length },
+      top: tagged
+        .map(t => ({ src: t.src, score: +score(t.quad).toFixed(3), quad: round(t.quad) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, top),
     };
   } finally {
     mats.forEach(m => m.delete());
   }
 }
 
+/** 테스트·디버그용: 주어진 사각형들의 채점 요소 */
+export function inspectQuads(cv: CV, img: RGBA, quads: Quad[]) {
+  const mats: Mat[] = [];
+  const track = (m: Mat) => (mats.push(m), m);
+  try {
+    const { field } = buildField(cv, img, track);
+    return quads.map(q => {
+      const quad = orderQuad(q);
+      return {
+        sides: quad.map((a, i) => +sideSupport(field, a, quad[(i + 1) % 4]).toFixed(2)),
+        support: +quadSupport(field, quad).toFixed(3),
+        area: +(Math.abs(polyArea(quad)) / (img.width * img.height)).toFixed(3),
+        aspect: +aspectFactor(quad).toFixed(3),
+        margin: +marginConsistency(field, quad).toFixed(3),
+      };
+    });
+  } finally {
+    mats.forEach(m => m.delete());
+  }
+}
+
 /**
- * 경계 기반 감지. extra로 다른 방법(영역 기반)의 후보를 넣으면 같은 기준으로 함께 채점.
+ * 경계 기반 감지(한 방향). extra로 다른 방법(영역 기반)의 후보를 넣으면 같은 기준으로 함께 채점.
  * 좌표는 입력 이미지 기준. 믿을 만한 사각형이 없으면 null.
  */
 export function detectByEdges(cv: CV, img: RGBA, extra: Quad[] = []): Detection | null {
@@ -329,24 +461,14 @@ export function detectByEdges(cv: CV, img: RGBA, extra: Quad[] = []): Detection 
   try {
     const { width: w, height: h } = img;
     const { field, edgesMat } = buildField(cv, img, track);
+    const lines = houghLines(cv, edgesMat, field, track);
     const candidates = [
       ...extra.map(q => orderQuad(q)),
       ...contourQuads(cv, edgesMat, w, h, track),
-      ...lineQuads(houghLines(cv, edgesMat, field, track), w, h),
+      ...lineQuads(lines.slice(0, MAX_LINES), w, h),
     ];
 
-    const minSide = 0.1 * Math.min(w, h);
-    const score = (quad: Quad) => {
-      if (!isConvex(quad)) return -1;
-      if (quad.some((p, i) => dist(p, quad[(i + 1) % 4]) < minSide)) return -1;
-      const areaFrac = Math.abs(polyArea(quad)) / (w * h);
-      if (areaFrac < MIN_AREA) return -1;
-      const support = quadSupport(field, quad);
-      if (support < MIN_SUPPORT) return -1;
-      // 경계 일치가 가장 중요하고, 비슷하면 큰 사각형(양식 안쪽 표가 아닌 종이 외곽)과 A4 비율 선호
-      return support * support * Math.sqrt(areaFrac) * aspectFactor(quad);
-    };
-
+    const score = makeScorer(field);
     let best: Detection | null = null;
     for (const quad of candidates) {
       const s = score(quad);
@@ -354,10 +476,36 @@ export function detectByEdges(cv: CV, img: RGBA, extra: Quad[] = []): Detection 
     }
     if (!best) return null;
 
+    best = cycleSides(best.quad, lines, score, w, h);
     const refined = orderQuad(refineQuad(field, best.quad));
     const rs = score(refined);
-    return rs >= best.score * 0.97 ? { quad: refined, score: rs } : best;
+    return rs >= best.score * 0.97 ? { quad: refined, score: rs } : { quad: orderQuad(best.quad), score: best.score };
   } finally {
     mats.forEach(m => m.delete());
   }
+}
+
+/**
+ * 사진을 0/90/180/270° 돌려 각각 감지한 뒤, 서로 가장 많이 일치한 결과를 채택.
+ * (직선 검출의 확률적 요소와 방향에 따른 미세한 차이를 투표로 걸러냄)
+ */
+export function detectRobust(cv: CV, img: RGBA): RobustDetection | null {
+  const { width: w, height: h } = img;
+  const found: Detection[] = [];
+  for (let k = 0; k < 4; k++) {
+    const r = k ? rotateRGBA(img, k) : img;
+    const region = detectByRegion(r);
+    const d = detectByEdges(cv, r, region ? [region.quad] : []);
+    if (d) found.push({ quad: orderQuad(d.quad.map(p => unrotatePoint(p, k, w, h))), score: d.score });
+  }
+  if (!found.length) return null;
+
+  const tol = 0.02 * Math.hypot(w, h);
+  const agree = (a: Detection, b: Detection) => a.quad.every((p, i) => dist(p, b.quad[i]) < tol);
+  let best = found[0], votes = 0;
+  for (const a of found) {
+    const v = found.filter(b => agree(a, b)).length;
+    if (v > votes || (v === votes && a.score > best.score)) { best = a; votes = v; }
+  }
+  return { ...best, votes };
 }

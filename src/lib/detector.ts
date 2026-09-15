@@ -4,7 +4,8 @@ import { type RGBA, detectByRegion } from './imgproc';
 
 export type DetectMethod = 'edges' | 'region' | 'none';
 export interface DetectRequest { id: number; img: RGBA; waitForEngine: boolean }
-export interface DetectResult { quad: Quad | null; method: DetectMethod; score: number }
+/** votes: 4방향 감지 중 이 결과와 일치한 수 (1~4) */
+export interface DetectResult { quad: Quad | null; method: DetectMethod; score: number; votes?: number }
 export type WorkerMessage =
   | { type: 'ready'; ok: boolean }
   | ({ type: 'result'; id: number } & DetectResult);

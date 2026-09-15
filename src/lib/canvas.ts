@@ -73,10 +73,71 @@ export function encodeJpeg(s: Surface, quality: number): Promise<Blob> {
     s.toBlob(b => (b ? resolve(b) : reject(new Error('JPEG 변환 실패'))), 'image/jpeg', quality));
 }
 
-/** EXIF 회전을 반영해 디코딩하고, 메모리 보호를 위해 긴 변을 maxSide로 제한 */
-export async function decodeImage(blob: Blob, maxSide = 4096): Promise<Surface> {
+/** JPEG 헤더에서 크기와 EXIF 방향만 읽음 (전체 디코딩 없이) */
+export function jpegInfo(bytes: DataView): { w: number; h: number; orientation: number } | null {
+  if (bytes.byteLength < 4 || bytes.getUint16(0) !== 0xffd8) return null;
+  let off = 2, orientation = 1;
+  while (off + 9 <= bytes.byteLength) {
+    const marker = bytes.getUint16(off);
+    if ((marker & 0xff00) !== 0xff00) return null;
+    const len = bytes.getUint16(off + 2);
+    if (marker === 0xffe1 && bytes.getUint32(off + 4) === 0x45786966) {
+      orientation = exifOrientation(bytes, off + 10) ?? orientation;
+    }
+    // SOF0~SOF15 (DHT·JPG·DAC 제외)에 높이·너비가 있음
+    if (marker >= 0xffc0 && marker <= 0xffcf && marker !== 0xffc4 && marker !== 0xffc8 && marker !== 0xffcc) {
+      return { h: bytes.getUint16(off + 5), w: bytes.getUint16(off + 7), orientation };
+    }
+    off += 2 + len;
+  }
+  return null;
+}
+
+function exifOrientation(v: DataView, tiff: number): number | null {
+  if (tiff + 8 > v.byteLength) return null;
+  const le = v.getUint16(tiff) === 0x4949;
+  const ifd = tiff + v.getUint32(tiff + 4, le);
+  if (ifd + 2 > v.byteLength) return null;
+  const count = v.getUint16(ifd, le);
+  for (let i = 0; i < count; i++) {
+    const e = ifd + 2 + i * 12;
+    if (e + 12 > v.byteLength) return null;
+    if (v.getUint16(e, le) === 0x0112) return v.getUint16(e + 8, le);
+  }
+  return null;
+}
+
+/**
+ * 기기 메모리에 맞춘 원본 최대 변 길이. 저사양 폰에서 큰 사진을 열 때 탭이 죽는 것을 막음
+ * (200dpi A4 출력은 긴 변 2339px)
+ */
+export const MAX_SOURCE_SIDE = (() => {
+  const gb = (navigator as unknown as { deviceMemory?: number }).deviceMemory ?? 4;
+  return gb <= 2 ? 2200 : gb <= 4 ? 2600 : 3200;
+})();
+
+/**
+ * EXIF 회전을 반영해 디코딩하고, 메모리 보호를 위해 긴 변을 maxSide로 제한.
+ * JPEG는 디코딩 단계에서 바로 줄여 받음 — 5천만 화소 사진도 원본 크기로 메모리에 올리지 않음.
+ * (Chrome은 EXIF 회전 후 크기를 조정하므로 표시 기준 크기를 넘김)
+ */
+export async function decodeImage(blob: Blob, maxSide = MAX_SOURCE_SIDE): Promise<Surface> {
   try {
-    const bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' });
+    let opts: ImageBitmapOptions = { imageOrientation: 'from-image' };
+    const info = jpegInfo(new DataView(await blob.slice(0, 512 * 1024).arrayBuffer()));
+    if (info) {
+      const [dw, dh] = info.orientation >= 5 ? [info.h, info.w] : [info.w, info.h];
+      const s = Math.min(1, maxSide / Math.max(dw, dh));
+      if (s < 1) {
+        opts = { ...opts, resizeWidth: Math.round(dw * s), resizeHeight: Math.round(dh * s), resizeQuality: 'high' };
+      }
+    }
+    let bmp: ImageBitmap;
+    try {
+      bmp = await createImageBitmap(blob, opts);
+    } catch {
+      bmp = await createImageBitmap(blob, { imageOrientation: 'from-image' }); // 크기 옵션 미지원 브라우저
+    }
     const out = scaled(bmp, maxSide);
     bmp.close();
     return out;
