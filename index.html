@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#ffffff">
+<title>문서 스캐너</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="home" class="home">
+  <header class="topbar">
+    <h1>문서 스캐너</h1>
+    <label class="quality">
+      화질
+      <select id="dpiSel">
+        <option value="150">표준 (150dpi)</option>
+        <option value="200" selected>고화질 (200dpi)</option>
+        <option value="300">인쇄용 (300dpi)</option>
+      </select>
+    </label>
+  </header>
+
+  <main id="dropZone" class="content">
+    <section id="empty" class="empty">
+      <div class="empty-art" aria-hidden="true">
+        <svg viewBox="0 0 120 120" width="96" height="96">
+          <path d="M28 18h46l18 18v66H28z" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+          <path d="M74 18v18h18" fill="none" stroke="currentColor" stroke-width="4" stroke-linejoin="round"/>
+          <path d="M40 56h40M40 68h40M40 80h26" stroke="currentColor" stroke-width="4" stroke-linecap="round"/>
+          <path d="M14 30V14h16M106 30V14H90M14 90v16h16M106 90v16H90" fill="none" stroke="var(--accent)" stroke-width="5" stroke-linecap="round"/>
+        </svg>
+      </div>
+      <h2>A4 문서를 찍어 PDF로</h2>
+      <p>사진에서 문서 영역을 자동으로 찾아<br>반듯하게 펴고, 스캔한 것처럼 보정합니다.</p>
+    </section>
+    <ol id="pages" class="pages"></ol>
+  </main>
+
+  <footer class="bottombar">
+    <label class="btn" for="camInput">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path d="M4 8h3l2-3h6l2 3h3v11H4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><circle cx="12" cy="13" r="3.5" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+      촬영
+    </label>
+    <label class="btn" for="fileInput">
+      <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 16l5-5 4 4 3-3 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+      사진 선택
+    </label>
+    <button id="exportBtn" class="btn primary" disabled>PDF 만들기</button>
+  </footer>
+
+  <input id="camInput" type="file" accept="image/*" capture="environment" hidden>
+  <input id="fileInput" type="file" accept="image/*" multiple hidden>
+</div>
+
+<!-- 편집기: 1단계 영역 조정, 2단계 보정 -->
+<div id="editor" class="editor" hidden>
+  <header class="ed-top">
+    <button id="edBack" class="ghost">취소</button>
+    <span id="edTitle">영역 조정</span>
+    <button id="edNext" class="primary">다음</button>
+  </header>
+
+  <div id="stage" class="stage">
+    <canvas id="edCanvas"></canvas>
+    <svg id="overlay"></svg>
+    <canvas id="loupe" class="loupe" hidden></canvas>
+  </div>
+
+  <div class="ed-tools" data-step="1">
+    <p class="hint">모서리나 변을 끌어 문서 테두리에 맞추세요</p>
+    <div class="row">
+      <button id="autoBtn" class="chip">자동 감지</button>
+      <button id="fullBtn" class="chip">사진 전체</button>
+    </div>
+  </div>
+
+  <div class="ed-tools" data-step="2" hidden>
+    <div class="row" id="filterRow" role="radiogroup" aria-label="필터">
+      <button class="chip" data-filter="original">원본</button>
+      <button class="chip" data-filter="enhance">선명하게</button>
+      <button class="chip" data-filter="gray">흑백</button>
+      <button class="chip" data-filter="bw">스캔 B&amp;W</button>
+    </div>
+    <div class="row">
+      <div class="seg" id="paperSeg" role="radiogroup" aria-label="용지">
+        <button data-paper="a4">A4</button>
+        <button data-paper="auto">원본 비율</button>
+      </div>
+      <button id="rotL" class="icon-btn" aria-label="왼쪽으로 회전">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M4 4v5h5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M5 9a8 8 0 1 1 1.5 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <button id="rotR" class="icon-btn" aria-label="오른쪽으로 회전">
+        <svg viewBox="0 0 24 24" width="20" height="20"><path d="M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M19 9a8 8 0 1 0-1.5 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+  </div>
+</div>
+
+<dialog id="exportDlg" class="dialog">
+  <form method="dialog">
+    <h3>PDF 저장</h3>
+    <label class="field">
+      파일 이름
+      <input id="fileName" type="text" autocomplete="off" spellcheck="false">
+    </label>
+    <p id="exportInfo" class="muted"></p>
+    <div class="dlg-actions">
+      <button value="cancel" class="ghost">취소</button>
+      <button id="shareBtn" type="button" hidden>공유</button>
+      <button id="saveBtn" type="button" class="primary">저장</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="busy" class="busy" hidden>
+  <div class="spinner"></div>
+  <span id="busyText">처리 중…</span>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+
+<script src="js/imgproc.js"></script>
+<script src="js/pdf.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
