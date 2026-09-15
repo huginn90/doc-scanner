@@ -79,6 +79,17 @@ async function renderOutput(page: Page, src: Surface) {
   page.out = { blob, w, h, pw, ph };
 }
 
+// 주소 끝에 ?debug 를 붙이면 감지 방법과 점수를 알려줌 (문제 보고용)
+const DEBUG = new URLSearchParams(location.search).has('debug');
+
+/** 감지 엔진을 처음 내려받는 중이면 로딩 문구를 바꿔 보여줌 */
+async function detect(src: Surface) {
+  const r = await detectDocument(src, msg => busy(msg));
+  if (DEBUG) console.info('detect', r);
+  if (DEBUG) setTimeout(() => toast(`감지: ${r.method} · 점수 ${r.score.toFixed(3)}`), 2700);
+  return r;
+}
+
 // ---------------------------------------------------------------- 사진 추가
 
 async function addFiles(list: FileList | File[]) {
@@ -90,7 +101,7 @@ async function addFiles(list: FileList | File[]) {
     await nextFrame();
     try {
       const src = await decodeImage(files[0]);
-      const { quad, found } = await detectDocument(src);
+      const { quad, found } = await detect(src);
       const page: Page = { id: nextId++, source: files[0], quad, settings: { ...state.defaults } };
       busy();
       openEditor(page, src, true);
@@ -109,7 +120,7 @@ async function addFiles(list: FileList | File[]) {
     await nextFrame();
     try {
       const src = await decodeImage(files[i]);
-      const { quad, found } = await detectDocument(src);
+      const { quad, found } = await detect(src);
       if (!found) missed++;
       const page: Page = { id: nextId++, source: files[i], quad, settings: { ...state.defaults } };
       await renderOutput(page, src);
@@ -437,7 +448,7 @@ function drawLoupe(p: Point) {
 $('#autoBtn').addEventListener('click', async () => {
   if (!ed) return;
   busy('문서를 찾는 중…');
-  const { quad, found } = await detectDocument(ed.src);
+  const { quad, found } = await detect(ed.src);
   busy();
   if (!ed) return;
   ed.quad = quad;

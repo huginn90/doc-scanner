@@ -3,33 +3,52 @@ import type { Quad } from './geometry';
 import { type RGBA, detectByRegion } from './imgproc';
 
 export type DetectMethod = 'edges' | 'region' | 'none';
-export interface DetectRequest { id: number; img: RGBA }
-export interface DetectReply { id: number; quad: Quad | null; method: DetectMethod }
+export interface DetectRequest { id: number; img: RGBA; waitForEngine: boolean }
+export interface DetectResult { quad: Quad | null; method: DetectMethod; score: number }
+export type WorkerMessage =
+  | { type: 'ready'; ok: boolean }
+  | ({ type: 'result'; id: number } & DetectResult);
 
+/** OpenCV(약 3.7MB) 첫 다운로드를 기다리는 최대 시간 */
+const ENGINE_WAIT_MS = 30000;
+
+type Status = 'loading' | 'ready' | 'failed';
+let status: Status = 'loading';
 let worker: Worker | null = null;
-let broken = false;
 let seq = 0;
-const pending = new Map<number, (r: DetectReply) => void>();
+const pending = new Map<number, (r: DetectResult) => void>();
+const statusWaiters = new Set<() => void>();
+
+function setStatus(s: Status) {
+  status = s;
+  statusWaiters.forEach(f => f());
+  statusWaiters.clear();
+}
 
 function getWorker(): Worker | null {
-  if (worker || broken) return worker;
+  if (worker || status === 'failed') return worker;
   try {
     worker = new Worker(new URL('../worker/detect.worker.ts', import.meta.url), { type: 'module' });
-    worker.onmessage = (e: MessageEvent<DetectReply>) => {
-      pending.get(e.data.id)?.(e.data);
-      pending.delete(e.data.id);
+    worker.onmessage = (e: MessageEvent<WorkerMessage>) => {
+      const msg = e.data;
+      if (msg.type === 'ready') {
+        setStatus(msg.ok ? 'ready' : 'failed');
+        return;
+      }
+      pending.get(msg.id)?.(msg);
+      pending.delete(msg.id);
     };
     worker.onerror = err => {
       console.error('감지 워커 오류', err);
       worker?.terminate();
       worker = null;
-      broken = true;
-      pending.forEach((resolve, id) => resolve({ id, quad: null, method: 'none' }));
+      setStatus('failed');
+      pending.forEach(resolve => resolve({ quad: null, method: 'none', score: 0 }));
       pending.clear();
     };
   } catch (err) {
     console.warn('워커를 만들 수 없어 메인 스레드에서 감지', err);
-    broken = true;
+    setStatus('failed');
   }
   return worker;
 }
@@ -39,16 +58,35 @@ export function warmUpDetector() {
   getWorker();
 }
 
-/** img의 버퍼는 워커로 넘어가므로 호출 후 사용하지 말 것 */
-export function detectQuad(img: RGBA): Promise<Omit<DetectReply, 'id'>> {
-  const w = getWorker();
+function waitForStatus(ms: number): Promise<void> {
+  if (status !== 'loading') return Promise.resolve();
+  return new Promise(resolve => {
+    const done = () => { clearTimeout(timer); statusWaiters.delete(done); resolve(); };
+    const timer = setTimeout(done, ms);
+    statusWaiters.add(done);
+  });
+}
+
+/**
+ * 문서 사각형 감지. img의 버퍼는 워커로 넘어가므로 호출 후 사용하지 말 것.
+ * 감지 엔진이 아직 내려받는 중이면 onWait로 알리고 기다림.
+ */
+export async function detectQuad(img: RGBA, onWait?: (msg: string) => void): Promise<DetectResult> {
+  let w = getWorker();
+  if (w && status === 'loading') {
+    onWait?.('감지 엔진 준비 중… (처음 한 번만)');
+    await waitForStatus(ENGINE_WAIT_MS);
+    w = getWorker();
+  }
   if (!w) {
     const d = detectByRegion(img);
-    return Promise.resolve({ quad: d?.quad ?? null, method: d ? 'region' : 'none' });
+    return { quad: d?.quad ?? null, method: d ? 'region' : 'none', score: d?.score ?? 0 };
   }
   const id = ++seq;
+  const worker = w;
   return new Promise(resolve => {
     pending.set(id, resolve);
-    w.postMessage({ id, img } satisfies DetectRequest, [img.data.buffer]);
+    const req: DetectRequest = { id, img, waitForEngine: status === 'ready' };
+    worker.postMessage(req, [img.data.buffer]);
   });
 }

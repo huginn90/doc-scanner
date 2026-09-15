@@ -10,16 +10,19 @@ import { type DetectMethod, detectQuad } from './detector';
 const DETECT_SIZE = 600;
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
-export async function detectDocument(src: Drawable): Promise<{ quad: Quad; found: boolean; method: DetectMethod }> {
+export interface DocumentDetection { quad: Quad; found: boolean; method: DetectMethod; score: number }
+
+/** onWait: 감지 엔진을 처음 내려받는 중일 때 표시할 안내 */
+export async function detectDocument(src: Drawable, onWait?: (msg: string) => void): Promise<DocumentDetection> {
   const W = src.width, H = src.height;
   const s = Math.min(1, DETECT_SIZE / Math.max(W, H));
   const img = readRGBA(src, 0, 0, W, H, W * s, H * s);
   const sx = W / img.width, sy = H / img.height; // img 버퍼는 워커로 넘어가므로 먼저 계산
-  const { quad: q, method } = await detectQuad(img);
-  const miss = { quad: defaultQuad(W, H), found: false, method };
+  const { quad: q, method, score } = await detectQuad(img, onWait);
+  const miss = { quad: defaultQuad(W, H), found: false, method, score };
   if (!q) return miss;
   const quad = orderQuad(q.map(p => ({ x: clamp(p.x * sx, 0, W), y: clamp(p.y * sy, 0, H) })));
-  return isConvex(quad) ? { quad, found: true, method } : miss;
+  return isConvex(quad) ? { quad, found: true, method, score } : miss;
 }
 
 export function warpDocument(src: Drawable, quad: Quad, outW: number, outH: number): RGBA {
