@@ -52,6 +52,16 @@ export function defaultQuad(w: number, h: number, inset = 0.08): Quad {
 export const scaleQuad = (q: readonly Point[], sx: number, sy = sx) =>
   q.map(p => ({ x: p.x * sx, y: p.y * sy })) as Quad;
 
+/** 시계 방향 k×90° 회전된 이미지의 좌표를 원본(w×h) 좌표로 되돌림 */
+export function unrotatePoint(p: Point, k: number, w: number, h: number): Point {
+  switch (((k % 4) + 4) % 4) {
+    case 1: return { x: p.y, y: h - p.x };
+    case 2: return { x: w - p.x, y: h - p.y };
+    case 3: return { x: w - p.y, y: p.x };
+    default: return { x: p.x, y: p.y };
+  }
+}
+
 /** src 4점을 dst 4점으로 보내는 호모그래피 [h11..h32, 1] */
 export function homography(src: readonly Point[], dst: readonly Point[]): number[] {
   const A: number[][] = [];

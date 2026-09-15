@@ -286,6 +286,8 @@ function closeEditor() {
   release(ed.src);
   release(ed.preview);
   ed = null;
+  // 화면 크기 × 픽셀 배율만큼 차지하는 편집 캔버스도 비움
+  edCanvas.width = edCanvas.height = 0;
   $('#editor').hidden = true;
 }
 
