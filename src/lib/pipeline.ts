@@ -3,7 +3,8 @@ import {
   type PageSettings, type Quad,
   defaultQuad, isConvex, orderQuad, outputSize,
 } from './geometry';
-import { type RGBA, applyFilter, cloneRGBA, warp, warpSourceRegion } from './imgproc';
+import { type Gray, type RGBA, warp, warpGray, warpSourceRegion } from './imgproc';
+import { grayDocument, grayToRGBA, luminance, rotateGray, scanDocument } from './filters';
 import { type Drawable, type Surface, readRGBA, rotate, toSurface } from './canvas';
 import { type DetectMethod, detectQuad } from './detector';
 
@@ -25,22 +26,47 @@ export async function detectDocument(src: Drawable, onWait?: (msg: string) => vo
   return isConvex(quad) ? { quad, found: true, method, score } : miss;
 }
 
-export function warpDocument(src: Drawable, quad: Quad, outW: number, outH: number): RGBA {
+/** 문서 주변만 잘라(필요하면 축소해) 읽고, 그 안에서의 사각형 좌표 */
+function sourceRegion(src: Drawable, quad: Quad, outW: number, outH: number): { img: RGBA; local: Quad } {
   const r = warpSourceRegion(quad, src.width, src.height, outW, outH);
   const img = readRGBA(src, r.x, r.y, r.w, r.h, r.w * r.scale, r.h * r.scale);
   const sx = img.width / r.w, sy = img.height / r.h;
-  const local = quad.map(p => ({ x: (p.x - r.x) * sx, y: (p.y - r.y) * sy })) as Quad;
+  return { img, local: quad.map(p => ({ x: (p.x - r.x) * sx, y: (p.y - r.y) * sy })) as Quad };
+}
+
+export function warpDocument(src: Drawable, quad: Quad, outW: number, outH: number): RGBA {
+  const { img, local } = sourceRegion(src, quad, outW, outH);
   return warp(img, local, outW, outH);
 }
 
-export function renderPage(src: Drawable, quad: Quad, settings: PageSettings, dpi: number): Surface {
-  const { w, h } = outputSize(quad, settings.paper, dpi);
-  const img = warpDocument(src, quad, w, h);
-  applyFilter(img, settings.filter);
-  return rotate(toSurface(img), settings.rot);
+/** 흑백·스캔용: 밝기 1채널로 보정 (RGBA의 1/4 메모리) */
+export function warpDocumentGray(src: Drawable, quad: Quad, outW: number, outH: number): Gray {
+  const { img, local } = sourceRegion(src, quad, outW, outH);
+  return warpGray(luminance(img), local, outW, outH);
 }
 
-/** 편집기 미리보기: 캐시된 보정 결과에 필터/회전만 적용 */
+export type Rendered =
+  /** 원본·흑백 → JPEG로 저장 */
+  | { kind: 'color'; surface: Surface }
+  /** 스캔 → 1비트 흑백으로 저장 */
+  | { kind: 'mono'; img: Gray };
+
+export function renderPage(src: Drawable, quad: Quad, settings: PageSettings, dpi: number): Rendered {
+  const { w, h } = outputSize(quad, settings.paper, dpi);
+  switch (settings.filter) {
+    case 'scan':
+      return { kind: 'mono', img: rotateGray(scanDocument(warpDocumentGray(src, quad, w, h)), settings.rot) };
+    case 'gray':
+      return { kind: 'color', surface: rotate(toSurface(grayToRGBA(grayDocument(warpDocumentGray(src, quad, w, h)))), settings.rot) };
+    default:
+      return { kind: 'color', surface: rotate(toSurface(warpDocument(src, quad, w, h)), settings.rot) };
+  }
+}
+
+/** 편집기 미리보기: 캐시된 보정 결과(RGBA)에 필터·회전만 적용 */
 export function finishPreview(warped: RGBA, settings: PageSettings): Surface {
-  return rotate(toSurface(applyFilter(cloneRGBA(warped), settings.filter)), settings.rot);
+  const out = settings.filter === 'scan' ? grayToRGBA(scanDocument(luminance(warped)))
+    : settings.filter === 'gray' ? grayToRGBA(grayDocument(luminance(warped)))
+    : warped;
+  return rotate(toSurface(out), settings.rot);
 }

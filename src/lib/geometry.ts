@@ -3,7 +3,7 @@
 export interface Point { x: number; y: number }
 export type Quad = [Point, Point, Point, Point];
 export type Paper = 'a4' | 'auto';
-export type FilterMode = 'original' | 'enhance' | 'gray' | 'bw';
+export type FilterMode = 'original' | 'gray' | 'scan';
 export interface PageSettings { paper: Paper; filter: FilterMode; rot: number }
 
 export const dist = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);

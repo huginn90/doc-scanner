@@ -4,15 +4,25 @@ import {
   defaultQuad, isConvex, orderQuad, outputSize, pageSizePt,
 } from './lib/geometry';
 import type { RGBA } from './lib/imgproc';
-import { type Surface, createSurface, ctx2d, decodeImage, encodeJpeg, release } from './lib/canvas';
+import {
+  MAX_SOURCE_SIDE, type Surface, createSurface, ctx2d, decodeImage, encodeJpeg, release, toSurface,
+} from './lib/canvas';
 import { detectDocument, finishPreview, renderPage, warpDocument } from './lib/pipeline';
-import { buildPdf } from './lib/pdf';
+import { packBits, thumbnailRGBA } from './lib/filters';
+import { type PdfImage, buildPdf, deflate } from './lib/pdf';
 import { warmUpDetector } from './lib/detector';
 
-const PREVIEW_DPI = 110;
-const JPEG_QUALITY = 0.88;
+/** 미리보기도 스캔 결과가 실제와 비슷하게 보이도록 너무 낮지 않게 */
+const PREVIEW_DPI = 150;
+const JPEG_QUALITY = 0.9;
 
-interface PageOut { blob: Blob; w: number; h: number; pw: number; ph: number }
+/**
+ * 스캔(1비트)은 해상도를 높여 가는 글씨를 살림 — 1비트 무손실이라 용량 부담이 적음.
+ * 메모리가 넉넉한 기기에서만 (200dpi → 300dpi)
+ */
+const scanDpi = (dpi: number) => (MAX_SOURCE_SIDE >= 3200 ? Math.max(dpi, Math.min(300, Math.round(dpi * 1.5))) : dpi);
+
+interface PageOut { image: PdfImage; w: number; h: number; pw: number; ph: number }
 interface Page {
   id: number;
   source: Blob;
@@ -25,7 +35,7 @@ interface Page {
 const state = {
   pages: [] as Page[],
   dpi: 200,
-  defaults: { paper: 'a4', filter: 'enhance', rot: 0 } as PageSettings,
+  defaults: { paper: 'a4', filter: 'scan', rot: 0 } as PageSettings,
 };
 let nextId = 1;
 
@@ -59,24 +69,38 @@ function toast(msg: string) {
   toastTimer = window.setTimeout(() => (t.hidden = true), 2600);
 }
 
+const THUMB_SIDE = 320;
+
 async function renderOutput(page: Page, src: Surface) {
-  const c = renderPage(src, page.quad, page.settings, state.dpi);
-  const w = c.width, h = c.height;
-  const [pw, ph] = pageSizePt(w, h, page.settings.paper);
-  const blob = await encodeJpeg(c, JPEG_QUALITY);
+  const scan = page.settings.filter === 'scan';
+  const r = renderPage(src, page.quad, page.settings, scan ? scanDpi(state.dpi) : state.dpi);
+  let image: PdfImage, w: number, h: number, thumb: Surface;
 
-  const ts = Math.min(1, 320 / Math.max(w, h));
-  const t = createSurface(w * ts, h * ts);
-  const tcx = ctx2d(t);
-  tcx.imageSmoothingQuality = 'high';
-  tcx.drawImage(c, 0, 0, t.width, t.height);
-  const thumbBlob = await encodeJpeg(t, 0.8);
-  release(t);
-  release(c);
+  if (r.kind === 'mono') {
+    ({ width: w, height: h } = r.img);
+    const bits = packBits(r.img);
+    const packed = await deflate(bits);
+    image = { kind: 'mono', bytes: packed ?? bits, deflated: !!packed };
+    thumb = toSurface(thumbnailRGBA(r.img, THUMB_SIDE));
+  } else {
+    const c = r.surface;
+    w = c.width;
+    h = c.height;
+    image = { kind: 'jpeg', bytes: new Uint8Array(await (await encodeJpeg(c, JPEG_QUALITY)).arrayBuffer()) };
+    const ts = Math.min(1, THUMB_SIDE / Math.max(w, h));
+    thumb = createSurface(w * ts, h * ts);
+    const tcx = ctx2d(thumb);
+    tcx.imageSmoothingQuality = 'high';
+    tcx.drawImage(c, 0, 0, thumb.width, thumb.height);
+    release(c);
+  }
 
+  const thumbBlob = await encodeJpeg(thumb, 0.8);
+  release(thumb);
   if (page.thumb) URL.revokeObjectURL(page.thumb);
   page.thumb = URL.createObjectURL(thumbBlob);
-  page.out = { blob, w, h, pw, ph };
+  const [pw, ph] = pageSizePt(w, h, page.settings.paper);
+  page.out = { image, w, h, pw, ph };
 }
 
 // 주소 끝에 ?debug 를 붙이면 감지 방법과 점수를 알려줌 (문제 보고용)
@@ -544,7 +568,7 @@ function defaultName() {
 }
 
 $('#exportBtn').addEventListener('click', () => {
-  const bytes = state.pages.reduce((s, p) => s + (p.out?.blob.size ?? 0), 0);
+  const bytes = state.pages.reduce((s, p) => s + (p.out?.image.bytes.length ?? 0), 0);
   fileNameInput.value = defaultName();
   $('#exportInfo').textContent = `${state.pages.length}페이지 · 약 ${(bytes / 1048576).toFixed(1)}MB`;
   const probe = new File([''], 'a.pdf', { type: 'application/pdf' });
@@ -556,10 +580,7 @@ async function makePdf() {
   let name = (fileNameInput.value.trim() || defaultName()).replace(/[\\/:*?"<>|]/g, '_');
   const title = name.replace(/\.pdf$/i, '');
   if (!/\.pdf$/i.test(name)) name += '.pdf';
-  const pages = await Promise.all(state.pages.filter(p => p.out).map(async p => {
-    const o = p.out!;
-    return { jpeg: new Uint8Array(await o.blob.arrayBuffer()), w: o.w, h: o.h, pw: o.pw, ph: o.ph };
-  }));
+  const pages = state.pages.flatMap(p => (p.out ? [p.out] : []));
   return { name, blob: buildPdf(pages, title) };
 }
 
