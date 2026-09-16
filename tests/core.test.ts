@@ -3,7 +3,7 @@ import {
   type Quad,
   applyHomography, homography, isConvex, orderQuad, outputSize, pageSizePt,
 } from '../src/lib/geometry';
-import { applyFilter, createRGBA, detectByRegion, warp } from '../src/lib/imgproc';
+import { detectByRegion, warp } from '../src/lib/imgproc';
 import { buildPdf } from '../src/lib/pdf';
 import { UNIT, cornerError, px, synthPhoto } from './synth';
 
@@ -59,32 +59,13 @@ describe('imgproc', () => {
     for (const x of [40, 105, 170]) expect(px(out, x, lineY)[0]).toBeLessThan(80);
   });
 
-  it('선명하게: 그림자진 종이가 균일한 흰색이 된다', () => {
-    const img = createRGBA(400, 400);
-    for (let y = 0; y < 400; y++) {
-      for (let x = 0; x < 400; x++) {
-        const shade = 0.6 + 0.4 * (x / 399); // 왼쪽이 어두움
-        const j = (y * 400 + x) * 4;
-        const ink = y > 195 && y < 205 && x > 50 && x < 350;
-        img.data[j] = (ink ? 30 : 235) * shade;
-        img.data[j + 1] = (ink ? 30 : 225) * shade;
-        img.data[j + 2] = (ink ? 30 : 205) * shade; // 누런 조명
-        img.data[j + 3] = 255;
-      }
-    }
-    applyFilter(img, 'enhance');
-    for (const x of [10, 200, 390]) {
-      const [r, g, b] = px(img, x, 100);
-      expect(Math.min(r, g, b)).toBeGreaterThan(240);
-    }
-    expect(px(img, 200, 200)[0]).toBeLessThan(40);
-  });
-
-  it('스캔 B&W: 배경은 흰색, 글자는 검정', () => {
-    const { img, corners } = synthPhoto();
-    const out = applyFilter(warp(img, corners, 420, 594), 'bw');
-    expect(px(out, 210, 40)[0]).toBe(255);
-    expect(px(out, 210, (0.15 + 0.01) * 594)[0]).toBeLessThan(20);
+  it('보정 크기가 같으면 이미지가 그대로 유지된다 (쌍삼차 보간)', () => {
+    const { img } = synthPhoto();
+    const full: Quad = [{ x: 0, y: 0 }, { x: img.width, y: 0 }, { x: img.width, y: img.height }, { x: 0, y: img.height }];
+    const out = warp(img, full, img.width, img.height);
+    let maxDiff = 0;
+    for (let i = 0; i < img.data.length; i += 4) maxDiff = Math.max(maxDiff, Math.abs(out.data[i] - img.data[i]));
+    expect(maxDiff).toBeLessThanOrEqual(1);
   });
 });
 
@@ -93,7 +74,7 @@ describe('imgproc', () => {
 describe('pdf', () => {
   it('xref 오프셋이 각 객체 시작을 가리킨다', async () => {
     const jpeg = new Uint8Array([0xff, 0xd8, 0x00, 0x11, 0x22, 0xff, 0xd9]);
-    const page = { jpeg, w: 10, h: 14, pw: 595.28, ph: 841.89 };
+    const page = { image: { kind: 'jpeg' as const, bytes: jpeg }, w: 10, h: 14, pw: 595.28, ph: 841.89 };
     const blob = buildPdf([page, page], '테스트 문서');
     const text = new TextDecoder('latin1').decode(new Uint8Array(await blob.arrayBuffer()));
     expect(text.startsWith('%PDF-1.4')).toBe(true);

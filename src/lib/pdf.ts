@@ -1,18 +1,30 @@
-// 최소 PDF 작성기: 페이지마다 JPEG 한 장(DCTDecode)을 페이지 전체에 배치
+// 최소 PDF 작성기: 페이지마다 이미지 한 장을 페이지 전체에 배치
+//  - 원본·흑백: JPEG (DCTDecode)
+//  - 스캔: 1비트 흑백 무손실 (FlateDecode) — 글자 번짐이 없고 용량도 작음
+
+export type PdfImage =
+  | { kind: 'jpeg'; bytes: Uint8Array }
+  /** 1비트 흑백 행 데이터 (1 = 흰색). deflated면 zlib 압축됨 */
+  | { kind: 'mono'; bytes: Uint8Array; deflated: boolean };
 
 export interface PdfPage {
-  jpeg: Uint8Array;
+  image: PdfImage;
   /** 이미지 픽셀 크기 */
   w: number;
   h: number;
   /** 페이지 크기(pt) */
   pw: number;
   ph: number;
-  /** 흑백 JPEG이면 DeviceGray */
-  gray?: boolean;
 }
 
 const enc = new TextEncoder();
+
+/** zlib(deflate) 압축 — PDF FlateDecode 형식. 지원하지 않는 브라우저면 null */
+export async function deflate(bytes: Uint8Array): Promise<Uint8Array | null> {
+  if (typeof CompressionStream === 'undefined') return null;
+  const stream = new Blob([bytes as BlobPart]).stream().pipeThrough(new CompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
 
 /** 한글 제목 등은 UTF-16BE 16진 문자열로 */
 export function pdfText(str: string): string {
@@ -28,6 +40,14 @@ export function pdfText(str: string): string {
 }
 
 const num = (v: number) => (Math.round(v * 100) / 100).toString();
+
+function imageDict(p: PdfPage): string {
+  const { image: img } = p;
+  const fmt = img.kind === 'jpeg'
+    ? '/ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode'
+    : `/ColorSpace /DeviceGray /BitsPerComponent 1${img.deflated ? ' /Filter /FlateDecode' : ''}`;
+  return `<< /Type /XObject /Subtype /Image /Width ${p.w} /Height ${p.h} ${fmt} /Length ${img.bytes.length} >>`;
+}
 
 export function buildPdf(pages: readonly PdfPage[], title: string): Blob {
   const chunks: Uint8Array[] = [];
@@ -60,11 +80,7 @@ export function buildPdf(pages: readonly PdfPage[], title: string): Blob {
     obj(id, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${num(p.pw)} ${num(p.ph)}] ` +
       `/Resources << /XObject << /Im0 ${id + 2} 0 R >> >> /Contents ${id + 1} 0 R >>`);
     obj(id + 1, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
-    obj(id + 2,
-      `<< /Type /XObject /Subtype /Image /Width ${p.w} /Height ${p.h} ` +
-      `/ColorSpace /${p.gray ? 'DeviceGray' : 'DeviceRGB'} ` +
-      `/BitsPerComponent 8 /Filter /DCTDecode /Length ${p.jpeg.length} >>\nstream\n`,
-      p.jpeg, '\nendstream');
+    obj(id + 2, `${imageDict(p)}\nstream\n`, p.image.bytes, '\nendstream');
   });
 
   const count = pageId(pages.length);

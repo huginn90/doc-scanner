@@ -1,10 +1,12 @@
 // 순수 이미지 처리 (RGBA 버퍼만 다룸 — 워커·테스트에서도 사용)
 import {
-  type FilterMode, type Point, type Quad,
+  type Point, type Quad,
   dist, homography, polyArea,
 } from './geometry';
 
 export interface RGBA { data: Uint8ClampedArray; width: number; height: number }
+/** 1채널 밝기 이미지 (흑백·스캔 보정용) */
+export interface Gray { data: Uint8ClampedArray; width: number; height: number }
 
 export const createRGBA = (width: number, height: number): RGBA =>
   ({ data: new Uint8ClampedArray(width * height * 4), width, height });
@@ -240,36 +242,59 @@ export function detectByRegion(img: RGBA): Detection | null {
 
 // ---------------------------------------------------------------- 원근 보정
 
-/** img 안의 quad 영역을 outW×outH 직사각형으로 펴기 (이중선형 보간) */
-export function warp(img: RGBA, quad: Quad, outW: number, outH: number): RGBA {
-  const { data: sd, width: cw, height: ch } = img;
+/**
+ * quad 영역을 outW×outH 직사각형으로 펴기. 쌍삼차(Catmull-Rom) 보간이라 주변 4×4 픽셀을 써서
+ * 이중선형보다 확대했을 때 글자 가장자리가 덜 뭉개짐. bpp=4면 RGBA, 1이면 밝기 1채널.
+ * (픽셀마다 수천만 번 도는 부분이라 가중치·인덱스를 인라인으로 계산)
+ */
+function warpPixels(src: Uint8ClampedArray, cw: number, ch: number, bpp: 1 | 4, quad: Quad, outW: number, outH: number) {
   const H = homography(
     [{ x: 0, y: 0 }, { x: outW, y: 0 }, { x: outW, y: outH }, { x: 0, y: outH }], quad);
-  const out = createRGBA(outW, outH);
-  const od = out.data;
-  const maxX = cw - 1.001, maxY = ch - 1.001, stride = cw * 4;
+  const out = new Uint8ClampedArray(outW * outH * bpp);
+  const channels = bpp === 4 ? 3 : 1;
+  const maxX = cw - 1, maxY = ch - 1, stride = cw * bpp;
   let o = 0;
   for (let v = 0; v < outH; v++) {
     const V = v + 0.5;
-    for (let u = 0; u < outW; u++, o += 4) {
+    const ax = H[1] * V + H[2], ay = H[4] * V + H[5], ad = H[7] * V + 1; // 행 안에서 변하지 않는 항
+    for (let u = 0; u < outW; u++, o += bpp) {
       const U = u + 0.5;
-      const den = H[6] * U + H[7] * V + 1;
-      let x = (H[0] * U + H[1] * V + H[2]) / den - 0.5;
-      let y = (H[3] * U + H[4] * V + H[5]) / den - 0.5;
+      const den = H[6] * U + ad;
+      let x = (H[0] * U + ax) / den - 0.5;
+      let y = (H[3] * U + ay) / den - 0.5;
       x = x < 0 ? 0 : x > maxX ? maxX : x;
       y = y < 0 ? 0 : y > maxY ? maxY : y;
-      const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0;
-      const i00 = y0 * stride + x0 * 4, i10 = i00 + 4, i01 = i00 + stride, i11 = i01 + 4;
-      for (let c = 0; c < 3; c++) {
-        const top = sd[i00 + c] + (sd[i10 + c] - sd[i00 + c]) * fx;
-        const bot = sd[i01 + c] + (sd[i11 + c] - sd[i01 + c]) * fx;
-        od[o + c] = top + (bot - top) * fy;
+      const xi = x | 0, yi = y | 0;
+      const tx = x - xi, tx2 = tx * tx, tx3 = tx2 * tx;
+      const ty = y - yi, ty2 = ty * ty, ty3 = ty2 * ty;
+      const wx0 = -0.5 * tx3 + tx2 - 0.5 * tx, wx1 = 1.5 * tx3 - 2.5 * tx2 + 1;
+      const wx2 = -1.5 * tx3 + 2 * tx2 + 0.5 * tx, wx3 = 0.5 * tx3 - 0.5 * tx2;
+      const wy0 = -0.5 * ty3 + ty2 - 0.5 * ty, wy1 = 1.5 * ty3 - 2.5 * ty2 + 1;
+      const wy2 = -1.5 * ty3 + 2 * ty2 + 0.5 * ty, wy3 = 0.5 * ty3 - 0.5 * ty2;
+      const c0 = (xi > 0 ? xi - 1 : 0) * bpp, c1 = xi * bpp;
+      const c2 = (xi < maxX ? xi + 1 : maxX) * bpp, c3 = (xi + 2 <= maxX ? xi + 2 : maxX) * bpp;
+      const r0 = (yi > 0 ? yi - 1 : 0) * stride, r1 = yi * stride;
+      const r2 = (yi < maxY ? yi + 1 : maxY) * stride, r3 = (yi + 2 <= maxY ? yi + 2 : maxY) * stride;
+      for (let c = 0; c < channels; c++) {
+        const a = r0 + c, b = r1 + c, d = r2 + c, e = r3 + c;
+        // Uint8ClampedArray가 반올림·범위 제한 (3차 보간의 오버슈트 처리)
+        out[o + c] =
+          wy0 * (wx0 * src[a + c0] + wx1 * src[a + c1] + wx2 * src[a + c2] + wx3 * src[a + c3]) +
+          wy1 * (wx0 * src[b + c0] + wx1 * src[b + c1] + wx2 * src[b + c2] + wx3 * src[b + c3]) +
+          wy2 * (wx0 * src[d + c0] + wx1 * src[d + c1] + wx2 * src[d + c2] + wx3 * src[d + c3]) +
+          wy3 * (wx0 * src[e + c0] + wx1 * src[e + c1] + wx2 * src[e + c2] + wx3 * src[e + c3]);
       }
-      od[o + 3] = 255;
+      if (bpp === 4) out[o + 3] = 255;
     }
   }
   return out;
 }
+
+export const warp = (img: RGBA, quad: Quad, outW: number, outH: number): RGBA =>
+  ({ data: warpPixels(img.data, img.width, img.height, 4, quad, outW, outH), width: outW, height: outH });
+
+export const warpGray = (img: Gray, quad: Quad, outW: number, outH: number): Gray =>
+  ({ data: warpPixels(img.data, img.width, img.height, 1, quad, outW, outH), width: outW, height: outH });
 
 /** 원본에서 잘라낼 영역과 축소 비율 (원본이 출력보다 훨씬 크면 미리 줄여 계단 현상 방지) */
 export function warpSourceRegion(quad: Quad, srcW: number, srcH: number, outW: number, outH: number) {
@@ -284,111 +309,4 @@ export function warpSourceRegion(quad: Quad, srcW: number, srcH: number, outW: n
   // 출력보다 약간(1.15배) 크게만 남겨 화질은 유지하면서 메모리 사용을 줄임
   const scale = Math.min(1, 1.15 * Math.max(outW / sideW, outH / sideH));
   return { x, y, w, h, scale };
-}
-
-// ---------------------------------------------------------------- 스캔 필터
-
-type ChannelFn = (d: Uint8ClampedArray, j: number) => number;
-const lumOf: ChannelFn = (d, j) => 0.299 * d[j] + 0.587 * d[j + 1] + 0.114 * d[j + 2];
-
-/** 종이 배경(조명/그림자) 추정: 블록 최대값 → 팽창 → 하한 → 블러 → 저해상도 격자 */
-function backgroundGrid(d: Uint8ClampedArray, w: number, h: number, channels: ChannelFn[]) {
-  const block = Math.max(4, Math.round(Math.max(w, h) / 100));
-  const gw = Math.ceil(w / block), gh = Math.ceil(h / block);
-  const grids = channels.map(() => new Float32Array(gw * gh));
-  for (let y = 0; y < h; y++) {
-    const gy = ((y / block) | 0) * gw;
-    for (let x = 0; x < w; x++) {
-      const gi = gy + ((x / block) | 0), j = (y * w + x) * 4;
-      for (let c = 0; c < channels.length; c++) {
-        const v = channels[c](d, j);
-        if (v > grids[c][gi]) grids[c][gi] = v;
-      }
-    }
-  }
-  for (let c = 0; c < grids.length; c++) {
-    const g = grids[c];
-    // 3x3 팽창: 굵은 글자/선을 배경으로 오인하지 않도록
-    const dil = new Float32Array(gw * gh);
-    for (let y = 0; y < gh; y++) {
-      for (let x = 0; x < gw; x++) {
-        let m = 0;
-        for (let yy = Math.max(0, y - 1); yy <= Math.min(gh - 1, y + 1); yy++)
-          for (let xx = Math.max(0, x - 1); xx <= Math.min(gw - 1, x + 1); xx++)
-            if (g[yy * gw + xx] > m) m = g[yy * gw + xx];
-        dil[y * gw + x] = m;
-      }
-    }
-    // 사진 등 넓은 어두운 영역이 하얗게 날아가지 않도록 하한
-    const sorted = Float32Array.from(dil).sort();
-    const paper = sorted[Math.floor(sorted.length * 0.9)] || 255;
-    const floor = Math.max(1, paper * 0.55);
-    for (let i = 0; i < dil.length; i++) if (dil[i] < floor) dil[i] = floor;
-    boxBlur(dil, gw, gh, 2);
-    boxBlur(dil, gw, gh, 2);
-    grids[c] = dil;
-  }
-  return { grids, block, gw, gh };
-}
-
-const clamp01 = (v: number) => (v < 0 ? 0 : v > 1 ? 1 : v);
-const stretch = (lo: number, hi: number, gamma: number) => (v: number) =>
-  Math.pow(clamp01((v - lo) / (hi - lo)), gamma);
-const smoothstep = (a: number, b: number) => (v: number) => {
-  const t = clamp01((v - a) / (b - a));
-  return t * t * (3 - 2 * t);
-};
-
-/** 인덱스 = (값/배경) × 1024, 1.25배까지 */
-function makeLut(fn: (v: number) => number) {
-  const lut = new Uint8ClampedArray(1281);
-  for (let k = 0; k <= 1280; k++) lut[k] = Math.round(255 * fn(k / 1024));
-  return lut;
-}
-
-const CURVES: Record<Exclude<FilterMode, 'original'>, () => (v: number) => number> = {
-  enhance: () => stretch(0.1, 0.9, 1.15),
-  gray: () => stretch(0.12, 0.88, 1.3),
-  bw: () => smoothstep(0.62, 0.78),
-};
-
-/** 조명 보정 + 톤 커브 (in-place) */
-export function applyFilter(img: RGBA, mode: FilterMode): RGBA {
-  if (mode === 'original') return img;
-  const { data: d, width: w, height: h } = img;
-  const perChannel = mode === 'enhance';
-  const channels: ChannelFn[] = perChannel
-    ? [(d, j) => d[j], (d, j) => d[j + 1], (d, j) => d[j + 2]]
-    : [lumOf];
-  const { grids, block, gw, gh } = backgroundGrid(d, w, h, channels);
-  const lut = makeLut(CURVES[mode]());
-
-  // 격자 → 픽셀 이중선형 보간 좌표 미리 계산
-  const x0s = new Int32Array(w), x1s = new Int32Array(w), fxs = new Float32Array(w);
-  for (let x = 0; x < w; x++) {
-    const g = Math.min(gw - 1, Math.max(0, (x + 0.5) / block - 0.5));
-    x0s[x] = g | 0; x1s[x] = Math.min(gw - 1, x0s[x] + 1); fxs[x] = g - x0s[x];
-  }
-  for (let y = 0; y < h; y++) {
-    const g = Math.min(gh - 1, Math.max(0, (y + 0.5) / block - 0.5));
-    const y0 = (g | 0) * gw, y1 = Math.min(gh - 1, (g | 0) + 1) * gw, fy = g - (g | 0);
-    for (let x = 0; x < w; x++) {
-      const j = (y * w + x) * 4, a = x0s[x], b = x1s[x], fx = fxs[x];
-      if (perChannel) {
-        for (let c = 0; c < 3; c++) {
-          const G = grids[c];
-          const top = G[y0 + a] + (G[y0 + b] - G[y0 + a]) * fx;
-          const bot = G[y1 + a] + (G[y1 + b] - G[y1 + a]) * fx;
-          d[j + c] = lut[Math.min(1280, (d[j + c] * 1024 / (top + (bot - top) * fy)) | 0)];
-        }
-      } else {
-        const G = grids[0];
-        const top = G[y0 + a] + (G[y0 + b] - G[y0 + a]) * fx;
-        const bot = G[y1 + a] + (G[y1 + b] - G[y1 + a]) * fx;
-        const v = lut[Math.min(1280, (lumOf(d, j) * 1024 / (top + (bot - top) * fy)) | 0)];
-        d[j] = d[j + 1] = d[j + 2] = v;
-      }
-    }
-  }
-  return img;
 }
